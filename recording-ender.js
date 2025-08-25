@@ -1,185 +1,156 @@
-// recording-ender.js
-// Script for automatically ending loop recordings in Ableton Live 12
-// This script will find any tracks currently recording and either play or stop them
-
-// Declaring global variables
 var live_api = null;
 var live_path = "live_set";
-var startTrack = 0;  // Default start track index
-var endTrack = -1;   // Default end track index (-1 means all tracks)
+var startTrack = 0;
+var endTrack = -1;
 
-// Called when the script is loaded
 function init() {
-    post("Recording Ender script initializing...\n");
-    
     try {
-        // Initialize Live API
         if (!live_api) {
             live_api = new LiveAPI();
-            if (!live_api) {
-                post("Error: Could not create Live API object\n");
-                return;
-            }
-            post("Live API initialized\n");
+            if (!live_api) return;
         }
-        
-        // Set the initial path to the live_set
         live_api.path = live_path;
-        post("Live set accessed successfully\n");
-    } catch (e) {
-        post("Error in initialization: " + e + "\n");
-    }
-    
-    post("Recording Ender script initialized and ready\n");
-    post("Current track range: " + startTrack + " to " + (endTrack === -1 ? "all" : endTrack) + "\n");
+    } catch (e) {}
 }
 
-// Function to set the start track index
 function setStartTrack(index) {
-    if (typeof index === 'number' && index >= 0) {
-        startTrack = index;
-        post("Start track set to: " + startTrack + "\n");
-    } else {
-        post("Invalid start track index: " + index + ". Must be a non-negative number.\n");
-    }
+    if (typeof index === 'number' && index >= 0) startTrack = index;
 }
 
-// Function to set the end track index
 function setEndTrack(index) {
-    if (typeof index === 'number') {
-        if (index >= 0 || index === -1) {
-            endTrack = index;
-            post("End track set to: " + (endTrack === -1 ? "all" : endTrack) + "\n");
-        } else {
-            post("Invalid end track index: " + index + ". Must be a non-negative number or -1 for all tracks.\n");
-        }
-    } else {
-        post("Invalid end track type. Must be a number.\n");
-    }
+    if (typeof index === 'number' && (index >= 0 || index === -1)) endTrack = index;
 }
 
-// Function to end recording and play the clips
 function endRecordPlay() {
-    post("End and Play button pressed\n");
     processRecordingClips("play");
 }
 
-// Function to end recording and stop the clips
 function endRecordStop() {
-    post("End and Stop button pressed\n");
     processRecordingClips("stop");
 }
 
-// Shared function to process recording clips with the specified action
-function processRecordingClips(action) {
-    if (!live_api) {
-        post("Error: Live API not initialized\n");
-        return;
-    }
-    
-    try {
-        // Navigate to the live_set
-        live_api.path = live_path;
-        
-        // Get the number of tracks
-        var numTracks = 0;
+function endRecordRecord() {
+    if (!live_api) return;
+    live_api.path = live_path;
+    var numTracks = 0;
+    try { numTracks = parseInt(live_api.getcount("tracks")); } catch (e) { return; }
+    var actualEndTrack = (endTrack === -1 || endTrack >= numTracks) ? numTracks - 1 : endTrack;
+    if (startTrack > actualEndTrack) return;
+    for (var i = startTrack; i <= actualEndTrack; i++) {
         try {
-            numTracks = parseInt(live_api.getcount("tracks"));
-            post("Number of tracks: " + numTracks + "\n");
-        } catch (e) {
-            post("Error getting track count: " + e + "\n");
-            return;
-        }
-        
-        // Determine actual end track index
-        var actualEndTrack = (endTrack === -1 || endTrack >= numTracks) ? numTracks - 1 : endTrack;
-        
-        // Validate track range
-        if (startTrack > actualEndTrack) {
-            post("Error: Start track (" + startTrack + ") is greater than end track (" + actualEndTrack + ")\n");
-            return;
-        }
-        
-        post("Processing tracks from " + startTrack + " to " + actualEndTrack + "\n");
-        
-        // Iterate through specified track range
-        for (var i = startTrack; i <= actualEndTrack; i++) {
-            try {
-                // Navigate to the current track
-                live_api.path = live_path + " tracks " + i;
-                
-                // Check if track exists and handle it
-                if (live_api.id !== "0") {
-                    processTrack(i, action);
+            var trackPath = live_path + " tracks " + i;
+            live_api.path = trackPath;
+            if (live_api.id === "0") continue;
+            var numClipSlots = parseInt(live_api.getcount("clip_slots"));
+            var recIndex = -1;
+            for (var j = 0; j < numClipSlots; j++) {
+                live_api.path = trackPath + " clip_slots " + j;
+                var hasClip = parseInt(live_api.get("has_clip"));
+                if (hasClip) {
+                    live_api.path = trackPath + " clip_slots " + j + " clip";
+                    var isRecording = parseInt(live_api.get("is_recording"));
+                    if (isRecording === 1) { recIndex = j; break; }
                 }
-            } catch (e) {
-                post("Error processing track " + i + ": " + e + "\n");
             }
-        }
-    } catch (e) {
-        post("Error in processRecordingClips: " + e + "\n");
+            if (recIndex === -1) continue;
+            var freeIndex = -1;
+            for (var k = recIndex + 1; k < numClipSlots; k++) {
+                live_api.path = trackPath + " clip_slots " + k;
+                if (parseInt(live_api.get("has_clip")) === 0) { freeIndex = k; break; }
+            }
+            if (freeIndex === -1) {
+                for (var k2 = 0; k2 < numClipSlots; k2++) {
+                    live_api.path = trackPath + " clip_slots " + k2;
+                    if (parseInt(live_api.get("has_clip")) === 0) { freeIndex = k2; break; }
+                }
+            }
+            if (freeIndex === -1) continue;
+            live_api.path = trackPath;
+            var canArmed = parseInt(live_api.get("can_be_armed"));
+            if (canArmed === 1 && parseInt(live_api.get("arm")) === 0) live_api.set("arm", 1);
+            live_api.path = trackPath + " clip_slots " + freeIndex;
+            live_api.call("fire");
+        } catch (e) {}
     }
 }
 
-// Process a single track to find recording clips
+function undoRecord() {
+    if (!live_api) return;
+    live_api.path = live_path;
+    var numTracks = 0;
+    try { numTracks = parseInt(live_api.getcount("tracks")); } catch (e) { return; }
+    var actualEndTrack = (endTrack === -1 || endTrack >= numTracks) ? numTracks - 1 : endTrack;
+    if (startTrack > actualEndTrack) return;
+    for (var i = startTrack; i <= actualEndTrack; i++) {
+        try {
+            var trackPath = live_path + " tracks " + i;
+            live_api.path = trackPath;
+            if (live_api.id === "0") continue;
+            var numClipSlots = parseInt(live_api.getcount("clip_slots"));
+            for (var j = 0; j < numClipSlots; j++) {
+                live_api.path = trackPath + " clip_slots " + j;
+                var hasClip = parseInt(live_api.get("has_clip"));
+                if (hasClip) {
+                    live_api.path = trackPath + " clip_slots " + j + " clip";
+                    var isRecording = parseInt(live_api.get("is_recording"));
+                    if (isRecording === 1) {
+                        live_api.path = trackPath;
+                        var canArmed = parseInt(live_api.get("can_be_armed"));
+                        if (canArmed === 1 && parseInt(live_api.get("arm")) === 0) live_api.set("arm", 1);
+                        live_api.path = trackPath + " clip_slots " + j;
+                        live_api.call("delete_clip");
+                        live_api.call("fire");
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+}
+
+function processRecordingClips(action) {
+    if (!live_api) return;
+    try {
+        live_api.path = live_path;
+        var numTracks = 0;
+        try { numTracks = parseInt(live_api.getcount("tracks")); } catch (e) { return; }
+        var actualEndTrack = (endTrack === -1 || endTrack >= numTracks) ? numTracks - 1 : endTrack;
+        if (startTrack > actualEndTrack) return;
+        for (var i = startTrack; i <= actualEndTrack; i++) {
+            try {
+                processTrack(i, action);
+            } catch (e) {}
+        }
+    } catch (e) {}
+}
+
 function processTrack(trackIndex, action) {
     try {
-        // Set path to the track
         var trackPath = live_path + " tracks " + trackIndex;
         live_api.path = trackPath;
-        
-        // Get track name for better logging
-        var trackName = live_api.get("name");
-        
-        // Get the number of clip slots in the track
         var numClipSlots = parseInt(live_api.getcount("clip_slots"));
-        post("Track " + trackIndex + " (" + trackName + ") has " + numClipSlots + " clip slots\n");
-        
-        // Iterate through all clip slots in the track
         for (var j = 0; j < numClipSlots; j++) {
             try {
-                // Navigate to the current clip slot
                 live_api.path = trackPath + " clip_slots " + j;
-                
-                // Check if there's a clip in this slot
                 var hasClip = parseInt(live_api.get("has_clip"));
-                
                 if (hasClip) {
-                    // Navigate to the clip
                     live_api.path = trackPath + " clip_slots " + j + " clip";
-                    
-                    // Check if the clip is currently recording
                     var isRecording = parseInt(live_api.get("is_recording"));
-                    
                     if (isRecording === 1) {
-                        post("Found recording clip at track " + trackIndex + " (" + trackName + "), clip slot " + j + "\n");
-                        
-                        // Perform the appropriate action based on the parameter
                         if (action === "play") {
                             live_api.call("fire");
-                            post("Ended recording and started playback for clip at track " + trackIndex + ", clip slot " + j + "\n");
                         } else if (action === "stop") {
                             live_api.call("stop");
-                            post("Ended recording and stopped playback for clip at track " + trackIndex + ", clip slot " + j + "\n");
                         }
                     }
                 }
-            } catch (e) {
-                post("Error processing clip slot " + j + " in track " + trackIndex + ": " + e + "\n");
-            }
+            } catch (e) {}
         }
-    } catch (e) {
-        post("Error in processTrack: " + e + "\n");
-    }
+    } catch (e) {}
 }
 
-// This is Max's message handling mechanism
 function anything() {
     var args = arrayfromargs(arguments);
     var msgName = args[0];
-    
-    post("Received message: " + msgName + "\n");
-    
     if (msgName === "init") {
         init();
     } else if (msgName === "endRecordPlay") {
@@ -190,5 +161,9 @@ function anything() {
         setStartTrack(parseInt(args[1]));
     } else if (msgName === "setEndTrack" && args.length > 1) {
         setEndTrack(parseInt(args[1]));
+    } else if (msgName === "endRecordRecord") {
+        endRecordRecord();
+    } else if (msgName === "undoRecord") {
+        undoRecord();
     }
 }
