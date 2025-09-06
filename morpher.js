@@ -1,42 +1,17 @@
-/* morpher.js — v3.8.1
-   - Includes device activator ("Device On") in snapshots/morphs
-   - Name-based snapshots; robust across parameter reordering
-   - Partial mode always includes/overrides power
-   - Zero-allocation morph path using double buffers (full & partial)
-   - getvalueof/setvalueof for pattr persistence
-   - observer auto-rebinds until neighbor device exists
-   - markDirty() -> notifyclients() after any persistent change
-   - NEW v3.8: "Link ->" toggle mirrors Morph dial to a later Morphling
-     * Skips Morphlings directly to the right when choosing the controlled target
-     * Link partner is the first Morphling to the right AFTER the first non-Morphling
-   - HOTFIX 3.8.1:
-     * Writer now skips non-finite values (prevents "SendMessage error 2: Bad parameter value")
-     * Full emitters mark invalid samples as NaN (so writer can skip)
-     * Seed lastWrite on bind to avoid undefined fallbacks
-*/
-
 autowatch = 1;
 inlets = 1;
 outlets = 2;
 
-// ------------------------------
-// Tunables
 var CHUNK_SIZE = 32;
 var CHUNK_INTERVAL_MS = 2;
 var MAX_SLOTS = 128;
 var OBS_INTERVAL_MS = 300;
 var EPS = 1e-6;
 
-// ------------------------------
-// Utils
 function toNum(x){ if(Array.isArray(x)) x = x[0]; var f = parseFloat(x); return (isFinite(f)?f:null); }
 function shallowClone(o){ var x={}; for(var k in o){ if(o.hasOwnProperty(k)) x[k]=o[k]; } return x; }
-
-// Tell pattr that value changed so Live will save it
 function markDirty(){ try { notifyclients(); } catch(e){} }
 
-// ------------------------------
-// Exclusions (allow activator!)
 var NAME_EXCLUDE=["Program","Program Change","Preset","Init","Category","Bank"];
 function shouldSkipName(n){
     n = (n||"").toString();
@@ -46,14 +21,10 @@ function shouldSkipName(n){
     return false;
 }
 
-// ------------------------------
-// Link feature state
-var LINK_ON = 0;        // UI toggle
-var linkParamId = 0;    // partner Morphling's "Morph" param id
-var linkDeviceId = 0;   // partner device id for quick validation
+var LINK_ON = 0;
+var linkParamId = 0;
+var linkDeviceId = 0;
 
-// ------------------------------
-// State
 var target = {
     id: 0,
     path: "",
@@ -61,6 +32,7 @@ var target = {
     className: "",
     paramIds: [],
     paramNames: [],
+    quant: [],
     byName: {}
 };
 var sets = new Array(MAX_SLOTS); for(var i=0;i<MAX_SLOTS;i++) sets[i]=null;
@@ -69,17 +41,13 @@ var currentSlot = 0;
 var PARTIAL_MODE = 0;
 var partialIdxs = null;
 var partialVersion = 0;
-var partialPosMap = null;
 
-// Signature tracking
 function sigKeyOf(t){
     if(!t) return "";
     return String(t.className||"") + "||" + (t.paramNames||[]).join("\x1f");
 }
 var lastSigKey = "";
 
-// ------------------------------
-// LiveAPI caches
 var paramCache = {};
 var lastWrite  = {};
 function resetCaches(){ paramCache = {}; lastWrite = {}; }
@@ -92,8 +60,6 @@ function getParamObj(id){
     return o;
 }
 
-// ------------------------------
-// Power parameter discovery + override
 var POWER_NAMES = ["Device On","On/Off","Active","Power","Enabled","Bypass"];
 var powerIdx = -1;
 var powerId  = 0;
@@ -106,7 +72,7 @@ function locatePower(){
         var nm = String(target.paramNames[i]||"");
         for(var j=0;j<POWER_NAMES.length;j++){
             if(nm.toLowerCase()===POWER_NAMES[j].toLowerCase()){
-                powerIdx = i; powerId = target.paramIds[i]; return;
+                powerIdx = i; powerId = target.paramIds[i]; recomputePowerGate(); return;
             }
         }
     }
@@ -116,26 +82,9 @@ function locatePower(){
             powerIdx = 0; powerId = target.paramIds[0];
         }
     }
+    recomputePowerGate();
 }
 
-function applyPowerOverrideToFullBuffer(buf){
-    if(powerOverride===null || powerIdx<0) return;
-    if(powerIdx < buf.length) buf[powerIdx][1] = powerOverride;
-}
-function applyPowerOverrideToPartBuffer(buf){
-    if(powerOverride===null || powerIdx<0 || !partialPosMap) return;
-    var m = partialPosMap[powerIdx];
-    if(m!==undefined && m < buf.length) buf[m][1] = powerOverride;
-}
-
-function rebuildPartialPosMap(){
-    partialPosMap = {};
-    if(!partialIdxs) return;
-    for(var m=0;m<partialIdxs.length;m++) partialPosMap[partialIdxs[m]] = m;
-}
-
-// ------------------------------
-// Writer queue
 var writeQueue = [];
 var queueIndex = 0;
 var writerActive = false;
@@ -151,17 +100,14 @@ function processQueue(){
     while(n < CHUNK_SIZE && queueIndex < writeQueue.length){
         var id = writeQueue[queueIndex][0];
         var v  = writeQueue[queueIndex][1];
+        var force = (writeQueue[queueIndex][2] === 1);
         queueIndex++;
-
-        // Skip invalid numbers so we never call LiveAPI with NaN/undefined/null
         if (typeof v !== "number" || !isFinite(v)) {
-            n++;
             continue;
         }
-
         try{
             var p = getParamObj(id);
-            if(lastWrite[id]===undefined || Math.abs(lastWrite[id] - v) > EPS){
+            if(force || lastWrite[id]===undefined || Math.abs(lastWrite[id] - v) > EPS){
                 p.set("value", v);
                 lastWrite[id] = v;
             }
@@ -175,43 +121,25 @@ function emitWriteQueueFromBuffer(buf, count){
     writeQueue.length = count;
     for(var i=0;i<count;i++) writeQueue[i] = buf[i];
     queueIndex = 0;
-    startWriter();
+    if(count>0) startWriter();
 }
 
-// ------------------------------
-// Double buffers
 var fullBufs = [[],[]], fullCap = [0,0], fullActive = 0;
 var partBufs = [[],[]], partCap = [0,0], partActive = 0;
 
 function ensureFullBuf(which, need){
     if(fullCap[which] < need){
-        for(var i=fullCap[which]; i<need; i++) fullBufs[which][i] = [0,0];
+        for(var i=fullCap[which]; i<need; i++) fullBufs[which][i] = [0,0,0];
         fullCap[which] = need;
     }
 }
 function ensurePartBuf(which, need){
     if(partCap[which] < need){
-        for(var i=partCap[which]; i<need; i++) partBufs[which][i] = [0,0];
+        for(var i=partCap[which]; i<need; i++) partBufs[which][i] = [0,0,0];
         partCap[which] = need;
     }
 }
-function refreshFullIds(which){
-    var ids = target.paramIds, L = ids.length;
-    ensureFullBuf(which, L);
-    for(var i=0;i<L;i++) fullBufs[which][i][0] = ids[i];
-}
-function refreshPartIds(which){
-    if(!partialIdxs) return;
-    var ids = target.paramIds, M = partialIdxs.length;
-    ensurePartBuf(which, M);
-    for(var m=0;m<M;m++){
-        var idx = partialIdxs[m];
-        partBufs[which][m][0] = ids[idx];
-    }
-}
 
-// ------------------------------
-// Labels
 function sendLabel(text){ outlet(1, String(text||"")); }
 function labelDevice(){
     var cnt = target && target.paramIds ? target.paramIds.length : 0;
@@ -220,8 +148,6 @@ function labelDevice(){
 }
 function labelMissing(){ sendLabel("Target not found"); }
 
-// ------------------------------
-// Discovery / binding helpers
 function parseParentAndIndexFromPath(unquotedPath){
     try{
         var toks=(unquotedPath||"").trim().split(/\s+/), last=-1;
@@ -246,25 +172,24 @@ function buildTargetFromDevice(dev){
     try{ cdn = dev.get("class_display_name"); if(Array.isArray(cdn)) cdn = cdn[0] || ""; }catch(e){ cdn = ""; }
 
     var total=0; try{ total = dev.getcount("parameters"); }catch(e){}
-    var ids=[], names=[], byName={};
+    var ids=[], names=[], byName={}, quant=[];
 
     for(var i=0;i<total;i++){
         var p = new LiveAPI(); p.path = (dev.unquotedpath||dev.path) + " parameters " + i;
         if(!p || p.id===0) continue;
-
         var pname = p.get("name"); if(Array.isArray(pname)) pname = pname[0] || "";
         if(shouldSkipName(pname)) continue;
-
+        var isq = 0; try{ isq = p.get("is_quantized"); if(Array.isArray(isq)) isq=isq[0]||0; }catch(e){ isq=0; }
         var idx = ids.length;
         ids.push(p.id);
         names.push(pname);
+        quant.push(isq?1:0);
         byName[pname] = { id:p.id, index: idx };
     }
 
-    return { id: dev.id, path: dev.unquotedpath || dev.path, name: dname, className: cdn, paramIds: ids, paramNames: names, byName: byName };
+    return { id: dev.id, path: dev.unquotedpath || dev.path, name: dname, className: cdn, paramIds: ids, paramNames: names, quant: quant, byName: byName };
 }
 
-// Morphling detection (by name or having Morph + Slot params)
 function isMorphlingTarget(t){
     if(!t) return false;
     var nm = String(t.name||"").toLowerCase();
@@ -287,7 +212,6 @@ function findParamIdByNameOnTarget(t, want){
     return 0;
 }
 
-// Find controlled device to the right (skip adjacent Morphlings)
 function candidateToRightOfThisDevice(){
     try{
         var me = new LiveAPI("this_device");
@@ -297,23 +221,18 @@ function candidateToRightOfThisDevice(){
         var myIndex    = parsed.index;
         var count      = getDeviceCountForParentPath(parentPath);
         var i = myIndex + 1;
-
-        // 1) Skip Morphlings immediately to the right
         for(; i<count; i++){
             var d = new LiveAPI(); d.path = parentPath + " devices " + i;
             var t = buildTargetFromDevice(d);
             if(!isMorphlingTarget(t)) break;
         }
         if(i >= count) return null;
-
-        // 2) First non-Morphling is our controlled target
         var dev = new LiveAPI(); dev.path = parentPath + " devices " + i;
         if(!dev || dev.id===0) return null;
         return buildTargetFromDevice(dev);
     }catch(e){ return null; }
 }
 
-// Find the link partner Morphling after the first non-Morphling to the right
 function findLinkPartner(){
     try{
         var me = new LiveAPI("this_device");
@@ -323,19 +242,13 @@ function findLinkPartner(){
         var myIndex    = parsed.index;
         var count      = getDeviceCountForParentPath(parentPath);
         var i = myIndex + 1;
-
-        // A) Skip Morphlings immediately to the right of THIS device
         for(; i<count; i++){
             var dA = new LiveAPI(); dA.path = parentPath + " devices " + i;
             var tA = buildTargetFromDevice(dA);
             if(!isMorphlingTarget(tA)) break;
         }
         if(i >= count) return null;
-
-        // B) Step over the first non-Morphling "anchor" device
         i++;
-
-        // C) From there, find the next Morphling to the right
         for(; i<count; i++){
             var dB = new LiveAPI(); dB.path = parentPath + " devices " + i;
             var tB = buildTargetFromDevice(dB);
@@ -371,8 +284,6 @@ function updateLinkToggleUI(){
     }catch(e){}
 }
 
-// ------------------------------
-// Discovery / binding
 function sigOf(t){
     if(!t) return null;
     var names = (t.paramNames||[]).slice().sort();
@@ -388,7 +299,7 @@ function isSigSupersetOrEqual(candSig, refSig){
 }
 
 function bindTo(newTarget){
-    target = newTarget || { id:0, path:"", name:"", className:"", paramIds:[], paramNames:[], byName:{} };
+    target = newTarget || { id:0, path:"", name:"", className:"", paramIds:[], paramNames:[], quant:[], byName:{} };
     resetCaches();
     stopWriter(); writeQueue=[]; queueIndex=0;
     locatePower();
@@ -398,10 +309,10 @@ function bindTo(newTarget){
     updatePartialToggleUI();
     if(target.id){
         reindexAllSnapshots();
-        refreshFullIds(0);
-        refreshFullIds(1);
-
-        // Seed lastWrite with current param values to avoid undefined fallbacks
+        rebuildUsedSlots();
+        recomputePowerGate();
+        ensureFullBuf(0, target.paramIds.length);
+        ensureFullBuf(1, target.paramIds.length);
         try {
             for (var i=0;i<target.paramIds.length;i++){
                 var pid = target.paramIds[i];
@@ -413,8 +324,6 @@ function bindTo(newTarget){
     }
 }
 
-// ------------------------------
-// Coll I/O (manual import/export)
 function outStoreV2(n, map){
     var flat=["store", n, "v2"];
     for(var k in map){ if(map.hasOwnProperty(k)){
@@ -426,13 +335,10 @@ function outStoreV2(n, map){
 }
 function outClearAll(){ outlet(0, ["clear"]); }
 
-// ------------------------------
-// Load / Save snapshots
-function loadset(){ // "loadset n ..." from [coll]
+function loadset(){
     if(arguments.length < 2) return;
     var n = parseInt(arguments[0],10);
     if(!isFinite(n) || n<0 || n>=MAX_SLOTS) return;
-
     if(arguments.length>=3 && (""+arguments[1]).toLowerCase()==="v2"){
         var map = {};
         for(var i=2;i<arguments.length;i+=2){
@@ -455,13 +361,14 @@ function loadset(){ // "loadset n ..." from [coll]
         sets[n] = arr;
     }
     if(n===currentSlot) updateSetButtonColor();
-    markDirty(); // <— state changed
+    rebuildUsedSlots();
+    recomputePowerGate();
+    markDirty();
 }
 
 function snapshot(n){
     if(!isBound()) return;
     n = parseInt(n,10); if(!isFinite(n) || n<0 || n>=MAX_SLOTS) return;
-
     var names = target.paramNames, ids = target.paramIds, L = names.length;
     var map = {}, arr = new Array(L);
     for(var i=0;i<L;i++){
@@ -475,11 +382,11 @@ function snapshot(n){
     sets[n] = { "__v":3, map: map, arr: arr, arrSigKey: sigKeyOf(target), pvals: null, pver: 0 };
     outStoreV2(n, map);
     if(n===currentSlot) updateSetButtonColor();
-    markDirty(); // <— new snapshot persisted
+    rebuildUsedSlots();
+    recomputePowerGate();
+    markDirty();
 }
 
-// ------------------------------
-// Reindexing
 function reindexSnapshotToCurrentOrder(S){
     if(!S) return;
     if(S.__v===3 && S.map){
@@ -520,13 +427,12 @@ function reindexAllSnapshots(){
             if(up) sets[k] = up;
         }
     }
+    rebuildUsedSlots();
+    recomputePowerGate();
 }
 
-// ------------------------------
-// Partial computation
 function invalidatePartial(){
     partialIdxs = null;
-    partialPosMap = null;
     partialVersion++;
     for(var k=0;k<MAX_SLOTS;k++){
         var S = sets[k];
@@ -542,7 +448,6 @@ function computePartialInfo(){
     if(!target || !target.paramNames) return;
     var L = target.paramNames.length;
     var key = sigKeyOf(target);
-
     var arrs = [];
     for(var k=0;k<MAX_SLOTS;k++){
         var S = sets[k]; if(!S) continue;
@@ -555,7 +460,6 @@ function computePartialInfo(){
         }
     }
     if(arrs.length <= 1){ return; }
-
     var idxs = [];
     for(var i=0;i<L;i++){
         var seen = NaN, have=false, changed=false;
@@ -569,10 +473,8 @@ function computePartialInfo(){
     }
     if(powerIdx >= 0 && idxs.indexOf(powerIdx) === -1){ idxs.push(powerIdx); }
     if(!idxs.length) return;
-
     partialIdxs = idxs;
     partialVersion++;
-
     for(var k2=0;k2<MAX_SLOTS;k2++){
         var S2 = sets[k2]; if(!S2 || S2.__v!==3 || !S2.arr) continue;
         var M = partialIdxs.length;
@@ -585,10 +487,8 @@ function computePartialInfo(){
         S2.pvals = pv;
         S2.pver = partialVersion;
     }
-
-    rebuildPartialPosMap();
-    refreshPartIds(0);
-    refreshPartIds(1);
+    ensurePartBuf(0, partialIdxs.length);
+    ensurePartBuf(1, partialIdxs.length);
 }
 
 function ensurePvals(S){
@@ -608,8 +508,6 @@ function ensurePvals(S){
     return pv;
 }
 
-// ------------------------------
-// Snapshot helpers
 function ensureArrObj(idx){
     var S = sets[idx];
     if(!S) return null;
@@ -630,28 +528,37 @@ function isSnapshotPowered(idx){
     return isFinite(v) && v > EPS;
 }
 
-// Power gate
-function computePowerGate(){
-    var F = -1, L = -1;
-    for(var i=0;i<MAX_SLOTS;i++){
-        var S = sets[i]; if(!S) continue;
-        if(isSnapshotPowered(i)){ F = i; break; }
+function touchSnapshotsChanged(){ rebuildUsedSlots(); recomputePowerGate(); }
+
+var usedSlots = [];
+function rebuildUsedSlots(){
+    usedSlots.length = 0;
+    for (var i=0;i<MAX_SLOTS;i++) if (sets[i]) usedSlots.push(i);
+}
+function neighborsOf(pos){
+    if (!usedSlots.length) return [-1,-1];
+    var lo=0, hi=usedSlots.length-1;
+    while (lo<=hi){
+        var mid=(lo+hi)>>1;
+        if (usedSlots[mid] < pos) lo=mid+1; else hi=mid-1;
     }
-    if(F >= 0){
-        for(var j=0;j<F;j++){
-            if(sets[j] && !isSnapshotPowered(j)) L = j;
-        }
-    }
-    return { firstOn:F, lastOff:L, T:(F<0 ? Infinity : (L+1)) };
+    var Ri = (lo < usedSlots.length) ? usedSlots[lo] : -1;
+    var Li = (lo > 0) ? usedSlots[lo-1] : -1;
+    return [Li, Ri];
 }
 
-function remapPosForPower(pos){
+var pGate = { firstOn:-1, lastOff:-1, T: Infinity };
+function recomputePowerGate(){
+    var F=-1, L=-1;
+    for (var i=0;i<MAX_SLOTS;i++){ var S=sets[i]; if(S && isSnapshotPowered(i)){ F=i; break; } }
+    if (F>=0){ for (var j=0;j<F;j++){ if(sets[j] && !isSnapshotPowered(j)) L=j; } }
+    pGate.firstOn = F; pGate.lastOff = L; pGate.T = (F<0 ? Infinity : (L+1));
+}
+function remapPosForPowerCached(pos){
     if(powerIdx < 0) { powerOverride = null; return pos; }
-
-    var g = computePowerGate();
+    var g = pGate;
     if(!(isFinite(g.T))){ powerOverride = 0; return pos; }
     if(g.lastOff < 0){ powerOverride = 1; return pos; }
-
     var L = g.lastOff, T = g.T;
     if(pos < T){
         powerOverride = 0;
@@ -665,121 +572,133 @@ function remapPosForPower(pos){
     return mapped;
 }
 
-// ------------------------------
-// Morph emitters
+function maybePushPair(id, val, buf, k, force){
+    if (typeof val !== "number" || !isFinite(val)) return k;
+    if (!force && lastWrite[id] !== undefined && Math.abs(lastWrite[id]-val) <= EPS) return k;
+    buf[k][0]=id; buf[k][1]=val; buf[k][2]=force?1:0; return k+1;
+}
+
 function emitFullFromArray(arr){
     if(!arr || !target) return;
     var ids=target.paramIds;
     var N = Math.min(arr.length, ids.length);
-
     var which = fullActive;
-    refreshFullIds(which);
-
+    ensureFullBuf(which, ids.length);
     var buf = fullBufs[which];
+    var k=0;
+    var force = (PARTIAL_MODE===0);
     for(var i=0;i<N;i++){
         var v = arr[i];
-        // Mark invalid values so writer will skip them
-        buf[i][1] = (isFinite(v) ? v : NaN);
+        if(powerOverride!==null && i===powerIdx) v = powerOverride;
+        k = maybePushPair(ids[i], v, buf, k, force);
     }
-    applyPowerOverrideToFullBuffer(buf);
-    emitWriteQueueFromBuffer(buf, N);
-
+    emitWriteQueueFromBuffer(buf, k);
     fullActive = 1 - fullActive;
-    refreshFullIds(fullActive);
 }
 
 function emitFullInterp(A, B, t){
     var ids=target.paramIds;
     var N = Math.min(A.length, B.length, ids.length);
-
     var which = fullActive;
-    refreshFullIds(which);
+    ensureFullBuf(which, ids.length);
     var buf = fullBufs[which];
+    var k=0;
+    var force = (PARTIAL_MODE===0);
     for(var i=0;i<N;i++){
-        var a=A[i], b=B[i];
-        if(!isFinite(a) || !isFinite(b)) {
-            // If one side is valid, send that; else mark as NaN for writer to skip
-            buf[i][1] = isFinite(a) ? a : (isFinite(b) ? b : NaN);
-            continue;
+        var a=A[i], b=B[i], val;
+        if(!isFinite(a) || !isFinite(b)) val = isFinite(a) ? a : (isFinite(b) ? b : NaN);
+        else{
+            if(target.quant && target.quant[i]) val = (t<0.5)?a:b;
+            else val = a + (b - a) * t;
         }
-        buf[i][1] = a + (b - a) * t;
+        if(powerOverride!==null && i===powerIdx) val = powerOverride;
+        k = maybePushPair(ids[i], val, buf, k, force);
     }
-    applyPowerOverrideToFullBuffer(buf);
-    emitWriteQueueFromBuffer(buf, N);
+    emitWriteQueueFromBuffer(buf, k);
     fullActive = 1 - fullActive;
-    refreshFullIds(fullActive);
 }
 
 function emitPartialFromPvals(Ap, Bp, t){
     var M = Math.min(Ap.length, Bp.length, partialIdxs.length);
     var which = partActive;
-    refreshPartIds(which);
+    ensurePartBuf(which, M);
     var buf = partBufs[which];
+    var k=0;
+    var force = false;
     for(var m=0;m<M;m++){
+        var idx = partialIdxs[m];
         var a=Ap[m], b=Bp[m];
-        if(!isFinite(a) || !isFinite(b)) { continue; }
-        buf[m][1] = a + (b - a) * t;
+        if(!isFinite(a) || !isFinite(b)) continue;
+        var val;
+        if(target.quant && target.quant[idx]) val = (t<0.5)?a:b;
+        else val = a + (b - a) * t;
+        if(powerOverride!==null && idx===powerIdx) val = powerOverride;
+        var id = target.paramIds[idx];
+        k = maybePushPair(id, val, buf, k, force);
     }
-    applyPowerOverrideToPartBuffer(buf);
-    emitWriteQueueFromBuffer(buf, M);
+    emitWriteQueueFromBuffer(buf, k);
     partActive = 1 - partActive;
-    refreshPartIds(partActive);
 }
 
 function emitPartialStatic(Pp){
     var M = Math.min(Pp.length, partialIdxs.length);
     var which = partActive;
-    refreshPartIds(which);
+    ensurePartBuf(which, M);
     var buf = partBufs[which];
+    var k=0;
+    var force = false;
     for(var m=0;m<M;m++){
+        var idx = partialIdxs[m];
         var v=Pp[m];
-        if(!isFinite(v)) continue;
-        buf[m][1] = v;
+        if(powerOverride!==null && idx===powerIdx) v = powerOverride;
+        var id = target.paramIds[idx];
+        k = maybePushPair(id, v, buf, k, force);
     }
-    applyPowerOverrideToPartBuffer(buf);
-    emitWriteQueueFromBuffer(buf, M);
+    emitWriteQueueFromBuffer(buf, k);
     partActive = 1 - partActive;
-    refreshPartIds(partActive);
 }
 
-// ------------------------------
-// Morph core
+var morphTask = new Task(_morphExec, this);
+var lastMorphV = -9999;
+var pendingMorph = -1;
+var morphScheduled = 0;
+
 function morph(v){
     if(Array.isArray(v)) v=v[0];
-    v = parseFloat(v); if(!isFinite(v)) return;
-    if(v < 0) v = 0; if(v > 127) v = 127;
+    var f = parseFloat(v);
+    if(!isFinite(f)) return;
+    if (f === lastMorphV) return;
+    pendingMorph = f;
+    if(!morphScheduled){ morphTask.schedule(0); morphScheduled=1; }
+}
 
-    // If linked, mirror our Morph dial value into the partner Morphling
+function _morphExec(){
+    var v = pendingMorph; pendingMorph = -1; morphScheduled=0; lastMorphV = v;
     if(LINK_ON && linkParamId){
         try{
-            var lp = getParamObj(linkParamId);
-            lp.set("value", v);
+            if (lastWrite[linkParamId]===undefined || Math.abs(lastWrite[linkParamId]-v)>EPS){
+                var lp = getParamObj(linkParamId);
+                lp.set("value", v);
+                lastWrite[linkParamId] = v;
+            }
         }catch(e){
-            // Try to re-resolve once if the partner disappeared/moved
             resolveLinkPartner();
         }
     }
-
     if(!isBound()) return;
-
     var t = v / 127.0;
     var pos = t * (MAX_SLOTS - 1);
-
-    pos = remapPosForPower(pos);
-
+    pos = remapPosForPowerCached(pos);
     var Lidx  = Math.floor(pos);
     var Ridx  = Math.ceil(pos);
-
-    function valid(S){ return !!S; }
-    function findLeft(i){ for(var k=i;k>=0;k--){ if(valid(sets[k])) return k; } return -1; }
-    function findRight(i){ for(var k=i;k<MAX_SLOTS;k++){ if(valid(sets[k])) return k; } return -1; }
-
-    var Li = findLeft(Lidx);
-    var Ri = findRight(Ridx);
-    if(Li<0 && Ri<0) return;
-
     function ensureArrObj_local(idx){ return ensureArrObj(idx); }
+    if(usedSlots.length===0) return;
 
+    var pair = neighborsOf(pos);
+    var Li = (pair[0]>=0)?pair[0]:-1;
+    var Ri = (pair[1]>=0)?pair[1]:-1;
+
+    if(Li<0 && Ri<0) return;
     if(Li>=0 && Ri<0){
         var SA = ensureArrObj_local(Li); if(!SA) return;
         if(PARTIAL_MODE && partialIdxs && partialIdxs.length){
@@ -794,7 +713,6 @@ function morph(v){
         }
         emitFullFromArray(SB.arr); return;
     }
-
     var SA = ensureArrObj_local(Li);
     var SB = ensureArrObj_local(Ri);
     if(!SA && !SB) return;
@@ -816,7 +734,6 @@ function morph(v){
         }
         emitFullFromArray(SA.arr); return;
     }
-
     var segt = (pos - Li) / (Ri - Li);
     if(PARTIAL_MODE && partialIdxs && partialIdxs.length){
         var Ap3 = ensurePvals(SA);
@@ -826,8 +743,6 @@ function morph(v){
     emitFullInterp(SA.arr, SB.arr, segt);
 }
 
-// ------------------------------
-// Slot + UI color
 function setSlot(v){
     var f = parseFloat(Array.isArray(v)?v[0]:v);
     if(!isFinite(f)) return;
@@ -836,7 +751,7 @@ function setSlot(v){
     idx = (idx<0?0:(idx>MAX_SLOTS-1?MAX_SLOTS-1:idx)) | 0;
     currentSlot = idx;
     updateSetButtonColor();
-    markDirty(); // <— slot is persisted
+    markDirty();
 }
 
 function haveSnapshotAt(idx){
@@ -880,8 +795,6 @@ function resetSetTextMomentary(){
     }catch(e){}
 }
 
-// ------------------------------
-// Observer
 var obsTask = new Task(observe, this);
 obsTask.interval = OBS_INTERVAL_MS;
 var lastMissing = false;
@@ -900,20 +813,16 @@ function observe(){
         if(!lastMissing){ labelMissing(); lastMissing = true; }
         return;
     }
-
     if(lastMissing){ labelDevice(); lastMissing = false; }
-
     var key = sigKeyOf(target);
     if(key !== lastSigKey){
         lastSigKey = key;
         reindexAllSnapshots();
-        refreshFullIds(0);
-        refreshFullIds(1);
+        ensureFullBuf(0, target.paramIds.length);
+        ensureFullBuf(1, target.paramIds.length);
         invalidatePartial();
         locatePower();
     }
-
-    // Keep link target fresh while linked
     if(LINK_ON){
         if(!linkDeviceId || !linkParamId){
             resolveLinkPartner();
@@ -926,25 +835,22 @@ function observe(){
     }
 }
 
-// ------------------------------
-// Set button behavior
 function outClearAllAndRAM(){
     for(var i=0;i<MAX_SLOTS;i++) sets[i]=null;
     outClearAll();
     updateSetButtonColor();
     invalidatePartial();
-    markDirty(); // <— cleared state persisted
+    touchSnapshotsChanged();
+    markDirty();
 }
 
 function handleSetPressed(){
     var cand = candidateToRightOfThisDevice();
-
     if(!cand){
         updateSetButtonColor();
         resetSetTextMomentary();
         return;
     }
-
     if(!target || !target.id){
         bindTo(cand);
         snapshot(currentSlot);
@@ -952,10 +858,8 @@ function handleSetPressed(){
         resetSetTextMomentary();
         return;
     }
-
     var candSig = sigOf(cand);
     var curSig  = sigOf(target);
-
     if(isSigSupersetOrEqual(candSig, curSig)){
         bindTo(cand);
         snapshot(currentSlot);
@@ -963,7 +867,6 @@ function handleSetPressed(){
         resetSetTextMomentary();
         return;
     }
-
     bindTo(cand);
     outClearAllAndRAM();
     snapshot(currentSlot);
@@ -983,11 +886,33 @@ function updatePartialToggleUI(){
     }catch(e){}
 }
 
-// ------------------------------
-// Commands & lifecycle
+function pushAllParamsImmediatelyInFull(){
+    if(!isBound()) return;
+    if(isFinite(lastMorphV) && lastMorphV >= 0){
+        pendingMorph = lastMorphV;
+        _morphExec();
+        return;
+    }
+    powerOverride = null;
+    var S = ensureArrObj(currentSlot);
+    if(S && S.arr){ emitFullFromArray(S.arr); }
+}
+
 function find(){ var cand = candidateToRightOfThisDevice(); if(cand) bindTo(cand); else labelMissing(); }
 function msg_float(v){ morph(v); }
 function list(){ if(arguments.length>0) morph(arguments[0]); }
+
+function clearSlot(idx){
+    idx = (isFinite(idx) ? (idx|0) : (currentSlot|0));
+    if (idx < 0 || idx >= MAX_SLOTS) return;
+    if (!sets[idx]) return;
+    sets[idx] = null;
+    outlet(0, ["delete", idx]);
+    if (idx === currentSlot) updateSetButtonColor();
+    invalidatePartial();
+    touchSnapshotsChanged();
+    markDirty();
+}
 
 function anything(){
     var a = arrayfromargs(messagename, arguments);
@@ -997,16 +922,25 @@ function anything(){
         else if(cmd==="slot" && a.length>1)    setSlot(a[1]);
         else if(cmd==="set")                   handleSetPressed();
         else if(cmd==="partial" && a.length>1){
+            var prev = PARTIAL_MODE;
             PARTIAL_MODE = (parseInt(a[1],10)?1:0);
             updatePartialToggleUI();
-            markDirty(); // <— partial mode persisted
+            markDirty();
+            if(prev===1 && PARTIAL_MODE===0){
+                pushAllParamsImmediatelyInFull();
+            }
         }
         else if(cmd==="chunksize" && a.length>1){
             var n = parseInt(a[1],10); if(isFinite(n) && n>0) CHUNK_SIZE = n;
         } else if(cmd==="chunkms" && a.length>1){
             var ms = parseInt(a[1],10); if(isFinite(ms) && ms>0){ CHUNK_INTERVAL_MS = ms; writerTask.interval = CHUNK_INTERVAL_MS; }
         } else if(cmd==="clear"){
+            clearSlot(currentSlot);
+        } else if(cmd==="clearall"){
             outClearAllAndRAM();
+        } else if(cmd==="clear_slot"){
+            var idx = (a.length > 1) ? parseInt(a[1],10) : currentSlot;
+            clearSlot(idx);
         } else if(cmd==="link" && a.length>1){
             LINK_ON = (parseInt(a[1],10)?1:0);
             updateLinkToggleUI();
@@ -1027,19 +961,24 @@ function init(){
     lastSigKey = sigKeyOf(target);
     startObserver();
     invalidatePartial();
-    refreshFullIds(0);
-    refreshFullIds(1);
+    ensureFullBuf(0, target.paramIds.length||0);
+    ensureFullBuf(1, target.paramIds.length||0);
     updatePartialToggleUI();
     updateLinkToggleUI();
     locatePower();
     if(LINK_ON) resolveLinkPartner();
 }
 
+// The "Clear" button sends 'clear' – make it per-slot.
 function clear(){
-    outClearAllAndRAM();
-    resetCaches(); stopWriter(); writeQueue=[]; queueIndex=0;
-    powerOverride = null;
+    clearSlot(currentSlot);
 }
+
+// Optional: make "Clear All" explicit (your Clear All button sends 'clearall').
+function clearall(){
+    outClearAllAndRAM();
+}
+
 
 function isBound(){
     try{
@@ -1051,10 +990,8 @@ function isBound(){
     }catch(e){ return false; }
 }
 
-function dump(){ /* no-op */ }
+function dump(){}
 
-// ------------------------------
-// State persistence for [pattr morpher_state @bindto morpher]
 function getvalueof(){
     var out = { v:1, currentSlot: currentSlot|0, partial: !!PARTIAL_MODE, link: !!LINK_ON, sets:{} };
     for (var i=0; i<MAX_SLOTS; i++){
@@ -1088,13 +1025,11 @@ function setvalueof(payload){
         currentSlot   = isFinite(obj && obj.currentSlot) ? (obj.currentSlot|0) : 0;
         PARTIAL_MODE  = (obj && obj.partial) ? 1 : 0;
         LINK_ON       = (obj && obj.link) ? 1 : 0;
-
         reindexAllSnapshots();
         computePartialInfo();
         updatePartialToggleUI();
         updateSetButtonColor();
         updateLinkToggleUI();
         if(LINK_ON) resolveLinkPartner();
-        // No markDirty() here; this is the restore path
     }catch(e){}
 }
