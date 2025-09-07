@@ -35,7 +35,7 @@ function sp(p) { // set path safely; returns true if valid
     return id !== 0;
   } catch (e) { return false; }
 }
-function getInt(prop) { // robust int getter (handles arrays/strings)
+function getInt(prop) {
   try {
     var v = live_api.get(prop);
     if (Array.isArray(v)) v = v[v.length - 1];
@@ -47,7 +47,7 @@ function getInt(prop) { // robust int getter (handles arrays/strings)
     return isNaN(n) ? null : n;
   } catch (e) { return null; }
 }
-function getFloat(prop) { // like getInt, but float
+function getFloat(prop) {
   try {
     var v = live_api.get(prop);
     if (Array.isArray(v)) v = v[v.length - 1];
@@ -62,7 +62,7 @@ function getFloat(prop) { // like getInt, but float
 function setSafe(prop, val) {
   try {
     if (val === null || typeof val === "undefined") return;
-    if (typeof val === "boolean") val = val ? 1 : 0; // coerce booleans
+    if (typeof val === "boolean") val = val ? 1 : 0;
     if (typeof val === "number" && isNaN(val)) return;
     live_api.set(prop, val);
   } catch (e) {}
@@ -89,7 +89,7 @@ function getClipTrigQuant() {
 function setClipTrigQuant(v) {
   if (!sp(live_path)) return;
   if (hasProp("clip_trigger_quantization")) setSafe("clip_trigger_quantization", v); // 0=None
-  if (hasProp("quantization")) setSafe("quantization", v); // keep in sync if present
+  if (hasProp("quantization")) setSafe("quantization", v);
 }
 function pushNoQuant() {
   if (!sp(live_path)) return;
@@ -97,7 +97,6 @@ function pushNoQuant() {
     _qtSaved = { ctq: hasProp("clip_trigger_quantization") ? getInt("clip_trigger_quantization") : null,
                  q:   hasProp("quantization") ? getInt("quantization") : null };
     setClipTrigQuant(0);
-    // tiny defer so Live applies it before fire
   }
   _qtStack++;
 }
@@ -134,11 +133,11 @@ function getSigDen() {
   } catch (e) { return 4; }
 }
 function ms_per_bar() {
-  var tempo = getTempo(); // bpm (quarter-notes per minute)
+  var tempo = getTempo();
   var num = getSigNum();
   var den = getSigDen();
-  var beatsPerBar = num * (4.0 / den);           // quarter-note beats per bar
-  var secPerBeat = 60.0 / tempo;                 // seconds per quarter-note
+  var beatsPerBar = num * (4.0 / den);
+  var secPerBeat = 60.0 / tempo;
   var secPerBar = secPerBeat * beatsPerBar;
   return Math.max(1, Math.round(secPerBar * 1000.0));
 }
@@ -157,12 +156,11 @@ function init(){ if(!live_api) live_api=new LiveAPI(); if(!live_api) return; sp(
 
 function record(v){ v=v|0; if(v===1) start(); else stop_and_delete(); }
 
-// Set recording length in bars (1–32). Usable messages: "bars 8", "length 8", "record_bars 8", "setbars 8"
+// Set recording length in bars (1–32). Messages: "bars 8", "length 8", "record_bars 8", "setbars 8"
 function bars(v){
   var nv = clampBars(v|0);
   recordBars = nv;
   log("bars", nv);
-  // Re-seed schedules to reflect new length immediately
   if (running && recordingActive) {
     if (taskA) { taskA.cancel(); taskA = null; }
     if (taskB) { taskB.cancel(); taskB = null; }
@@ -193,7 +191,6 @@ function start(){
   slotA=-1; slotB=-1; cntA=0; cntB=0; tA=0; tB=0;
 
   start_transport_watch();
-  // If we're already playing, kick off immediately
   if(get_is_playing()===1) onTransportStarted();
 }
 
@@ -223,8 +220,8 @@ function scheduleBInit(ms){
   var delay = (typeof ms === "number" && ms > 0) ? ms : Math.max(1, Math.round(get_record_ms()/2));
   taskBInit=new Task(function(){
     if(!running||!recordingActive) return;
-    relaunch_same_slot("B");
-    scheduleB(get_record_ms());
+    relaunch_same_slot("B");   // first stagger at L/2
+    scheduleB(get_record_ms()); // then steady cadence of L
   },this);
   taskBInit.schedule(delay);
 }
@@ -261,7 +258,6 @@ function relaunch_same_slot(which){
   ensure_armed(tp);
   var idx=(which==="A")?slotA:slotB;
 
-  // first time this lane is used → find empty slot
   if(idx<0){
     var nidx=next_empty_slot(tp);
     if(nidx<0){ abort_failure(); return; }
@@ -290,7 +286,7 @@ function keep_on(which){
   var idx=(which==="A")?slotA:slotB;
   if(idx<0) return;
 
-  if(sp(tp+" clip_slots "+idx)) callSafe("stop"); // keep clip in place
+  if(sp(tp+" clip_slots "+idx)) callSafe("stop");
 
   var next=next_empty_slot(tp);
   if(next<0) return;
@@ -325,31 +321,24 @@ function next_empty_slot(tp){
   return -1;
 }
 
-// IMMEDIATE fire: temporarily set clip trigger quantization to None + retry once if needed
+// IMMEDIATE fire with temporary no-quant + one retry if Live ignores the first fire
 function fire_now(slotPath, which){
   try{
     if(!sp(slotPath)) return;
 
-    // Make it immediate
     pushNoQuant();
-
-    // Defer the actual fire to ensure quant switch is applied
-    var fired = false;
 
     var doFire = function(){
       if (!sp(slotPath)) { popNoQuant(); return; }
       callSafe("fire");
-      fired = true;
       log("fire", which||"", "→", slotPath);
 
-      // restore shortly after to avoid affecting user launches
       var restore = new Task(function(){ popNoQuant(); }, this);
       restore.schedule(10);
 
-      // sanity check: if not recording after a short moment, try once more
       var verify = new Task(function(){
         if(!sp(slotPath)) return;
-        var rec = getInt("is_recording");    // ClipSlot property
+        var rec = getInt("is_recording");
         var hc  = getInt("has_clip");
         if(rec!==1 && hc===0){
           log("retry fire", which||"", "→", slotPath);
@@ -359,7 +348,7 @@ function fire_now(slotPath, which){
           restore2.schedule(10);
         }
       }, this);
-      verify.schedule(40); // small delay to allow Live to begin recording
+      verify.schedule(40);
     };
 
     var def = new Task(doFire, this);
@@ -383,8 +372,8 @@ function tag_clip(slotPath,which,count){
 
         if(rec===0 || rec===null){
           setSafe("looping", 0);             // on Clip
-          setSafe("launch_quantization", 0); // on Clip: ensure manual launches are immediate too
-          return; // done
+          setSafe("launch_quantization", 0); // make manual relaunches immediate too
+          return;
         }
       }
 
@@ -452,15 +441,20 @@ function start_transport_watch(){
 
 function stop_transport_watch(){ if(transportPoll){ transportPoll.cancel(); transportPoll=null; } }
 
+// *** CHANGE HERE: launch BOTH lanes immediately, then stagger B by L/2 ***
 function onTransportStarted(){
   if(!running) return;
   if(recordingActive){ log("transport started (already active)"); return; }
   recordingActive=true;
-  log("transport started → immediate launch");
-  // wipe & restart lanes in-place
-  relaunch_same_slot("A");                         // now
-  scheduleA(get_record_ms());                      // cadence = N bars
-  scheduleBInit(Math.max(1, Math.round(get_record_ms()/2)));  // offset for B = half-length
+  log("transport started → immediate launch A+B");
+
+  // Start both now so they're always recording
+  relaunch_same_slot("A"); // t = 0
+  relaunch_same_slot("B"); // t = 0
+
+  // Then restart B at half interval and A at full interval
+  scheduleBInit(Math.max(1, Math.round(get_record_ms()/2))); // t = L/2, then every L
+  scheduleA(get_record_ms());                                 // t = L, then every L
 }
 
 function onTransportStopped(){
