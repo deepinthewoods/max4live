@@ -231,30 +231,41 @@ function scheduleBInit(ms){
 function resolve_tracks(){
     try{
         var dev = new LiveAPI("this_device");
-        var devId = dev.id;
+        var devId = dev.id|0;
         sp(live_path);
 
         var nTracks = countChildren(live_path, "tracks", 1024);
         var found = -1;
-        for(var i=0;i<nTracks;i++){
-            var tp = live_path+" tracks "+i;
+
+        // Find the track that contains this device
+        for (var i = 0; i < nTracks; i++) {
+            var tp = live_path + " tracks " + i;
             var nDev = countChildren(tp, "devices", 256);
-            for(var d=0; d<nDev; d++){
-                var dp = tp+" devices "+d;
-                if(!sp(dp)) continue;
-                if((live_api.id|0)===(devId|0)){ found = i; break; }
+            for (var d = 0; d < nDev; d++) {
+                var dp = tp + " devices " + d;
+                if (!sp(dp)) continue;
+                if ((live_api.id|0) === devId) { found = i; break; }
             }
-            if(found!==-1) break;
+            if (found !== -1) break;
         }
-        if(found===-1 || found+1>=nTracks) return false;
-        hostIndex = found;
-        partnerIndex = found+1;
-        hostPath = live_path+" tracks "+hostIndex;
-        partnerPath = live_path+" tracks "+partnerIndex;
-        log("tracks host",hostIndex,"partner",partnerIndex);
+
+        // Device is on its own track at index `found`
+        // Use the following two tracks as the ping/pong tracks
+        if (found === -1 || (found + 2) >= nTracks) return false;
+
+        hostIndex = found + 1;     // first ping/pong track
+        partnerIndex = found + 2;  // second ping/pong track
+
+        hostPath = live_path + " tracks " + hostIndex;
+        partnerPath = live_path + " tracks " + partnerIndex;
+
+        log("tracks device", found, "host", hostIndex, "partner", partnerIndex);
         return true;
-    }catch(e){ return false; }
+    } catch(e) { 
+        return false; 
+    }
 }
+
 
 function relaunch_same_slot(which){
     var tp = (which==="A")?hostPath:partnerPath;
